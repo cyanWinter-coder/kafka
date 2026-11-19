@@ -99,6 +99,35 @@ The evolution timeline of the Consumer rebalance protocol is described in [KIP-1
   * **Apache Kafka 5.0**: `KafkaConsumer` defaults to `Consumer` protocol, while still supporting `Classic` 
   * **Apache Kafka 6.0**: `KafkaConsumer` only supports `Consumer` as rebalance protocol, while the broker still supports `Classic` for backward compatibility.
 
+## Failure Handling During Rebalances
+
+Heartbeat session timeouts, failed offset commits and member re-joins can coincide during a
+rebalance. The consumer group protocol handles their combination as follows, without any wire
+protocol change:
+
+  * **Heartbeat timeout.** When a member's heartbeat session times out, the consumer resets its
+    generation and treats its previously owned partitions as lost. The heartbeat thread and the
+    rebalance callback thread synchronize on the group generation: a join that completes with a
+    stale (already reset) generation is discarded instead of being applied, so a partition is
+    never assigned twice to the same member.
+  * **Duplicate join.** If a member re-joins while the coordinator still has its previous
+    registration (for example right after a session timeout), the coordinator fences the stale
+    member/epoch and the retried join converges to a single membership. On the client, a
+    completed re-join only assigns the partitions that are not already owned, so a duplicate
+    join does not result in a duplicate assignment.
+  * **Failed offset commit.** An offset commit that fails because of the rebalance itself
+    (`REBALANCE_IN_PROGRESS`, `UNKNOWN_MEMBER_ID`, `ILLEGAL_GENERATION`, coordinator failover)
+    is retriable: the member completes the rebalance first and then retries the commit. A failed
+    commit never overwrites the last successful one.
+  * **Preserving the last successful commit.** The classic consumer tracks the last offset it
+    successfully committed for each partition. If, after re-joining, the coordinator returns no
+    committed offset for a partition being initialized (for example because the group was
+    re-created while the member was rejoining), the consumer falls back to its last successful
+    commit for that partition instead of the `auto.offset.reset` policy. This avoids re-consuming
+    already committed data (or skipping it with `latest`). Offsets returned by the coordinator
+    always take precedence over this local fallback, and the fallback is only used to initialize
+    the fetch position; it never changes what the application can commit explicitly.
+
 ## Limitations
 
   * Client-side assignors are not supported and not in scope at the moment. Use [KAFKA-18327](https://issues.apache.org/jira/browse/KAFKA-18327) to provide feedback if you have custom assignment strategies that may not be covered.

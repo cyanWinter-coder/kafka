@@ -3410,6 +3410,144 @@ public abstract class ConsumerCoordinatorTest {
     }
 
     @Test
+    public void testSyncCommitRecordsLastSuccessfulCommit() {
+        client.prepareResponse(groupCoordinatorResponse(node, Errors.NONE));
+        coordinator.ensureCoordinatorReady(time.timer(Long.MAX_VALUE));
+
+        assertTrue(coordinator.lastSuccessfulCommits().isEmpty());
+
+        prepareOffsetCommitRequest(singletonMap(t1p, 100L), Errors.NONE);
+        assertTrue(coordinator.commitOffsetsSync(singletonMap(t1p, new OffsetAndMetadata(100L)), time.timer(Long.MAX_VALUE)));
+
+        assertEquals(singletonMap(t1p, new OffsetAndMetadata(100L)), coordinator.lastSuccessfulCommits());
+    }
+
+    @Test
+    public void testAsyncCommitRecordsLastSuccessfulCommit() {
+        client.prepareResponse(groupCoordinatorResponse(node, Errors.NONE));
+        coordinator.ensureCoordinatorReady(time.timer(Long.MAX_VALUE));
+
+        prepareOffsetCommitRequest(singletonMap(t1p, 100L), Errors.NONE);
+        AtomicBoolean success = new AtomicBoolean(false);
+        coordinator.commitOffsetsAsync(singletonMap(t1p, new OffsetAndMetadata(100L)), callback(success));
+        coordinator.invokeCompletedOffsetCommitCallbacks();
+
+        assertTrue(success.get());
+        assertEquals(singletonMap(t1p, new OffsetAndMetadata(100L)), coordinator.lastSuccessfulCommits());
+    }
+
+    @Test
+    public void testFailedCommitPreservesLastSuccessfulCommit() {
+        client.prepareResponse(groupCoordinatorResponse(node, Errors.NONE));
+        coordinator.ensureCoordinatorReady(time.timer(Long.MAX_VALUE));
+
+        prepareOffsetCommitRequest(singletonMap(t1p, 100L), Errors.NONE);
+        assertTrue(coordinator.commitOffsetsSync(singletonMap(t1p, new OffsetAndMetadata(100L)), time.timer(Long.MAX_VALUE)));
+        assertEquals(singletonMap(t1p, new OffsetAndMetadata(100L)), coordinator.lastSuccessfulCommits());
+
+        // The next commit fails (e.g. the coordinator fails over while the member's heartbeat
+        // session is timing out); the last successful commit must be preserved.
+        prepareOffsetCommitRequest(singletonMap(t1p, 150L), Errors.COORDINATOR_NOT_AVAILABLE);
+        assertFalse(coordinator.commitOffsetsSync(singletonMap(t1p, new OffsetAndMetadata(150L)), time.timer(0)));
+
+        assertEquals(singletonMap(t1p, new OffsetAndMetadata(100L)), coordinator.lastSuccessfulCommits());
+    }
+
+    @Test
+    public void testFailedAsyncCommitPreservesLastSuccessfulCommit() {
+        client.prepareResponse(groupCoordinatorResponse(node, Errors.NONE));
+        coordinator.ensureCoordinatorReady(time.timer(Long.MAX_VALUE));
+
+        prepareOffsetCommitRequest(singletonMap(t1p, 100L), Errors.NONE);
+        assertTrue(coordinator.commitOffsetsSync(singletonMap(t1p, new OffsetAndMetadata(100L)), time.timer(Long.MAX_VALUE)));
+
+        prepareOffsetCommitRequest(singletonMap(t1p, 150L), Errors.UNKNOWN_MEMBER_ID);
+        AtomicBoolean success = new AtomicBoolean(false);
+        coordinator.commitOffsetsAsync(singletonMap(t1p, new OffsetAndMetadata(150L)), callback(success));
+        coordinator.invokeCompletedOffsetCommitCallbacks();
+
+        assertFalse(success.get());
+        assertEquals(singletonMap(t1p, new OffsetAndMetadata(100L)), coordinator.lastSuccessfulCommits());
+    }
+
+    @Test
+    public void testRefreshOffsetFallsBackToLastSuccessfulCommit() {
+        client.prepareResponse(groupCoordinatorResponse(node, Errors.NONE));
+        coordinator.ensureCoordinatorReady(time.timer(Long.MAX_VALUE));
+
+        prepareOffsetCommitRequest(singletonMap(t1p, 100L), Errors.NONE);
+        assertTrue(coordinator.commitOffsetsSync(singletonMap(t1p, new OffsetAndMetadata(100L)), time.timer(Long.MAX_VALUE)));
+
+        // The partition is (re-)assigned but the coordinator has no committed offset for it,
+        // e.g. after the group was re-created following a heartbeat timeout. The consumer
+        // should resume from the last successful commit instead of the auto reset policy.
+        subscriptions.assignFromUser(singleton(t1p));
+        client.prepareResponse(offsetFetchResponse(t1p, Errors.NONE, "", -1L));
+        coordinator.initWithCommittedOffsetsIfNeeded(time.timer(Long.MAX_VALUE));
+
+        assertEquals(Collections.emptySet(), subscriptions.initializingPartitions());
+        assertTrue(subscriptions.hasAllFetchPositions());
+        assertEquals(100L, subscriptions.position(t1p).offset);
+    }
+
+    @Test
+    public void testRefreshOffsetPrefersCoordinatorOffsetOverLastSuccessfulCommit() {
+        client.prepareResponse(groupCoordinatorResponse(node, Errors.NONE));
+        coordinator.ensureCoordinatorReady(time.timer(Long.MAX_VALUE));
+
+        prepareOffsetCommitRequest(singletonMap(t1p, 100L), Errors.NONE);
+        assertTrue(coordinator.commitOffsetsSync(singletonMap(t1p, new OffsetAndMetadata(100L)), time.timer(Long.MAX_VALUE)));
+
+        // The coordinator does have a committed offset; it always wins over the local cache.
+        subscriptions.assignFromUser(singleton(t1p));
+        client.prepareResponse(offsetFetchResponse(t1p, Errors.NONE, "", 200L));
+        coordinator.initWithCommittedOffsetsIfNeeded(time.timer(Long.MAX_VALUE));
+
+        assertEquals(Collections.emptySet(), subscriptions.initializingPartitions());
+        assertTrue(subscriptions.hasAllFetchPositions());
+        assertEquals(200L, subscriptions.position(t1p).offset);
+    }
+
+    @Test
+    public void testRejoinAfterHeartbeatTimeoutRestoresLastSuccessfulCommit() {
+        subscriptions.setRebalanceListener(rebalanceListener, rebalanceConsumer);
+        subscriptions.subscribe(singleton(topic1));
+        joinAsFollowerAndReceiveAssignment(coordinator, singletonList(t1p));
+        assertEquals(singleton(t1p), subscriptions.assignedPartitions());
+
+        // Commit succeeds in the joined generation.
+        prepareOffsetCommitRequest(singletonMap(t1p, 100L), Errors.NONE);
+        assertTrue(coordinator.commitOffsetsSync(singletonMap(t1p, new OffsetAndMetadata(100L)), time.timer(Long.MAX_VALUE)));
+        assertEquals(singletonMap(t1p, new OffsetAndMetadata(100L)), coordinator.lastSuccessfulCommits());
+
+        // The heartbeat thread detects a session timeout and resets the generation; the
+        // previously owned partitions are lost and the assignment is cleared.
+        assertTrue(coordinator.onJoinPrepare(time.timer(rebalanceTimeoutMs),
+            AbstractCoordinator.Generation.NO_GENERATION.generationId,
+            AbstractCoordinator.Generation.NO_GENERATION.memberId));
+        assertEquals(singleton(t1p), rebalanceListener.lost);
+        assertTrue(subscriptions.assignedPartitions().isEmpty());
+
+        // The member re-joins (a duplicate join from the coordinator's point of view, since the
+        // previous member may not have expired yet) and receives the same partition again.
+        coordinator.requestRejoin("heartbeat session timeout expired");
+        client.prepareResponse(joinGroupFollowerResponse(2, consumerId, "leader", Errors.NONE));
+        client.prepareResponse(syncGroupResponse(singletonList(t1p), Errors.NONE));
+        coordinator.joinGroupIfNeeded(time.timer(Long.MAX_VALUE));
+        assertEquals(singleton(t1p), subscriptions.assignedPartitions());
+
+        // The coordinator has no committed offset for the partition; the consumer must fall
+        // back to the last successful commit rather than resetting to the auto offset reset
+        // policy, so the partition is not re-consumed from the beginning.
+        client.prepareResponse(offsetFetchResponse(t1p, Errors.NONE, "", -1L));
+        coordinator.initWithCommittedOffsetsIfNeeded(time.timer(Long.MAX_VALUE));
+
+        assertEquals(Collections.emptySet(), subscriptions.initializingPartitions());
+        assertTrue(subscriptions.hasAllFetchPositions());
+        assertEquals(100L, subscriptions.position(t1p).offset);
+    }
+
+    @Test
     public void testNoCoordinatorDiscoveryIfPositionsKnown() {
         assertTrue(coordinator.coordinatorUnknown());
 

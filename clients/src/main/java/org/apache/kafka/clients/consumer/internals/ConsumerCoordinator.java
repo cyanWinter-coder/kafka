@@ -85,7 +85,9 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.SortedSet;
 import java.util.TreeSet;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -156,6 +158,14 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
     private final RebalanceProtocol protocol;
     // Wraps the logic for invoking the RebalanceListener methods
     private final ConsumerRebalanceListenerInvoker rebalanceListenerInvoker;
+    // Tracks the last offset this member successfully committed for each partition. This is
+    // used to preserve the last successful commit when a heartbeat timeout, a failed offset
+    // commit and a (duplicate) re-join coincide: if the coordinator cannot return a committed
+    // offset for a partition being initialized after the re-join, the consumer falls back to
+    // this cache instead of the auto offset reset policy, which avoids re-consuming already
+    // committed data (or skipping it with "latest"). The map is only updated after the broker
+    // has acknowledged the commit, so a failed commit never overwrites the last successful one.
+    private final ConcurrentMap<TopicPartition, OffsetAndMetadata> lastSuccessfulCommits;
     // pending commit offset request in onJoinPrepare
     private RequestFuture<Void> autoCommitOffsetRequestFuture = null;
     // a timer for join prepare to know when to stop.
@@ -240,6 +250,7 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
         this.inFlightAsyncCommits = new AtomicInteger();
         this.pendingAsyncCommits = new AtomicInteger();
         this.asyncCommitFenced = new AtomicBoolean(false);
+        this.lastSuccessfulCommits = new ConcurrentHashMap<>();
         this.groupMetadata = new ConsumerGroupMetadata(rebalanceConfig.groupId,
             JoinGroupRequest.UNKNOWN_GENERATION_ID, JoinGroupRequest.UNKNOWN_MEMBER_ID, rebalanceConfig.groupInstanceId);
         this.throwOnFetchStableOffsetsUnsupported = throwOnFetchStableOffsetsUnsupported;
@@ -952,8 +963,47 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
         if (offsets == null)
             return false;
 
-        refreshCommittedOffsets(offsets, this.metadata, this.subscriptions);
+        refreshCommittedOffsets(withLastSuccessfulCommitFallback(initializingPartitions, offsets), this.metadata, this.subscriptions);
         return true;
+    }
+
+    /**
+     * Fill in the last offset this member successfully committed for any initializing partition
+     * for which the coordinator returned no committed offset. This can happen when a heartbeat
+     * session timeout, a failed offset commit and a re-join (possibly a duplicate join while the
+     * previous member had not yet expired on the coordinator) coincide: the group may then have
+     * no committed offset for a partition even though this member successfully committed one
+     * earlier. Falling back to the last successful commit keeps the consumer from rewinding to
+     * the auto offset reset policy in that case, which would cause duplicate consumption (or
+     * data loss with "latest"). Offsets returned by the coordinator always take precedence over
+     * the local cache.
+     */
+    private Map<TopicPartition, OffsetAndMetadata> withLastSuccessfulCommitFallback(final Set<TopicPartition> initializingPartitions,
+                                                                                    final Map<TopicPartition, OffsetAndMetadata> fetchedOffsets) {
+        if (lastSuccessfulCommits.isEmpty())
+            return fetchedOffsets;
+
+        final Map<TopicPartition, OffsetAndMetadata> offsetsToApply = new HashMap<>(fetchedOffsets);
+        for (final TopicPartition tp : initializingPartitions) {
+            if (offsetsToApply.get(tp) == null) {
+                final OffsetAndMetadata lastSuccessfulCommit = lastSuccessfulCommits.get(tp);
+                if (lastSuccessfulCommit != null) {
+                    log.info("Found no committed offset for partition {} on the coordinator; falling back to the " +
+                        "last successfully committed offset {} known to this member", tp, lastSuccessfulCommit);
+                    offsetsToApply.put(tp, lastSuccessfulCommit);
+                }
+            }
+        }
+        return offsetsToApply;
+    }
+
+    // Visible for testing: the last offset this member successfully committed for each partition.
+    Map<TopicPartition, OffsetAndMetadata> lastSuccessfulCommits() {
+        return Collections.unmodifiableMap(lastSuccessfulCommits);
+    }
+
+    private void recordSuccessfulCommit(final Map<TopicPartition, OffsetAndMetadata> offsets) {
+        lastSuccessfulCommits.putAll(offsets);
     }
 
     /**
@@ -1027,6 +1077,7 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
                 invokeCompletedOffsetCommitCallbacks();
             }
         } finally {
+            lastSuccessfulCommits.clear();
             super.close(timer, membershipOperation);
             Utils.closeQuietly(coordinatorMetrics, "consumer coordinator metrics");
             Utils.closeQuietly(rebalanceCallbackMetricsManager, "consumer rebalance callback metrics");
@@ -1111,6 +1162,7 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
 
                 if (interceptors != null)
                     interceptors.onCommit(offsets);
+                recordSuccessfulCommit(offsets);
                 completedOffsetCommits.add(new OffsetCommitCompletion(cb, offsets, null));
             }
 
@@ -1169,6 +1221,7 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
             if (future.succeeded()) {
                 if (interceptors != null)
                     interceptors.onCommit(offsets);
+                recordSuccessfulCommit(offsets);
                 return true;
             }
 

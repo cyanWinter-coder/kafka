@@ -8801,6 +8801,152 @@ class KafkaApisTest extends Logging {
   }
 
   @Test
+  def testHandleDuplicateJoinGroupRequests(): Unit = {
+    // A member whose heartbeat session is about to time out may retry its JoinGroup while the
+    // coordinator still has the previous member registered. Each join must be forwarded to the
+    // group coordinator (which is responsible for fencing the stale member) and each response
+    // must be routed back to the right request.
+    val joinGroupRequest = new JoinGroupRequestData()
+      .setGroupId("group")
+      .setMemberId("member")
+      .setProtocolType("consumer")
+      .setRebalanceTimeoutMs(1000)
+      .setSessionTimeoutMs(2000)
+
+    val firstRequest = buildRequest(new JoinGroupRequest.Builder(joinGroupRequest).build())
+    val secondRequest = buildRequest(new JoinGroupRequest.Builder(joinGroupRequest).build())
+
+    val firstFuture = new CompletableFuture[JoinGroupResponseData]()
+    val secondFuture = new CompletableFuture[JoinGroupResponseData]()
+    when(groupCoordinator.joinGroup(
+      firstRequest.context,
+      joinGroupRequest,
+      RequestLocal.noCaching.bufferSupplier
+    )).thenReturn(firstFuture)
+    when(groupCoordinator.joinGroup(
+      secondRequest.context,
+      joinGroupRequest,
+      RequestLocal.noCaching.bufferSupplier
+    )).thenReturn(secondFuture)
+
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleJoinGroupRequest(firstRequest, RequestLocal.noCaching)
+    kafkaApis.handleJoinGroupRequest(secondRequest, RequestLocal.noCaching)
+
+    // The duplicate (retried) join is answered by the coordinator with the same generation,
+    // so the member does not get a duplicate assignment.
+    val joinGroupResponse = new JoinGroupResponseData()
+      .setMemberId("member")
+      .setGenerationId(1)
+      .setLeader("leader")
+      .setProtocolType("consumer")
+      .setProtocolName("range")
+    firstFuture.complete(joinGroupResponse)
+    secondFuture.complete(joinGroupResponse)
+
+    assertEquals(joinGroupResponse, verifyNoThrottling[JoinGroupResponse](firstRequest).data)
+    assertEquals(joinGroupResponse, verifyNoThrottling[JoinGroupResponse](secondRequest).data)
+  }
+
+  @Test
+  def testHandleJoinGroupRequestUnknownMemberId(): Unit = {
+    // A join that arrives after the member's heartbeat session timed out on the coordinator
+    // is rejected with UNKNOWN_MEMBER_ID so that the member re-joins with a fresh member id.
+    val joinGroupRequest = new JoinGroupRequestData()
+      .setGroupId("group")
+      .setMemberId("member")
+      .setProtocolType("consumer")
+      .setRebalanceTimeoutMs(1000)
+      .setSessionTimeoutMs(2000)
+
+    val requestChannelRequest = buildRequest(new JoinGroupRequest.Builder(joinGroupRequest).build())
+
+    val future = new CompletableFuture[JoinGroupResponseData]()
+    when(groupCoordinator.joinGroup(
+      requestChannelRequest.context,
+      joinGroupRequest,
+      RequestLocal.noCaching.bufferSupplier
+    )).thenReturn(future)
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleJoinGroupRequest(
+      requestChannelRequest,
+      RequestLocal.noCaching
+    )
+
+    future.completeExceptionally(Errors.UNKNOWN_MEMBER_ID.exception)
+    val response = verifyNoThrottling[JoinGroupResponse](requestChannelRequest)
+    assertEquals(Errors.UNKNOWN_MEMBER_ID, response.error)
+  }
+
+  @Test
+  def testHandleOffsetCommitRequestRebalanceInProgress(): Unit = {
+    // An offset commit that arrives while the group is rebalancing (e.g. because the member's
+    // heartbeat session timed out and a re-join is in progress) must be rejected with
+    // REBALANCE_IN_PROGRESS so that the client completes the rebalance and retries instead of
+    // treating the last successful commit as lost.
+    val topicName = "foo"
+    val topicId = Uuid.randomUuid()
+    addTopicToMetadataCache(topicName, topicId = topicId, numPartitions = 1)
+
+    val offsetCommitRequest = new OffsetCommitRequestData()
+      .setGroupId("group")
+      .setMemberId("member")
+      .setTopics(util.List.of(
+        new OffsetCommitRequestData.OffsetCommitRequestTopic()
+          .setTopicId(topicId)
+          .setName(topicName)
+          .setPartitions(util.List.of(
+            new OffsetCommitRequestData.OffsetCommitRequestPartition()
+              .setPartitionIndex(0)
+              .setCommittedOffset(10)))))
+
+    val requestChannelRequest = buildRequest(OffsetCommitRequest.Builder.forTopicIdsOrNames(offsetCommitRequest).build())
+
+    val future = new CompletableFuture[OffsetCommitResponseData]()
+    when(groupCoordinator.commitOffsets(
+      requestChannelRequest.context,
+      offsetCommitRequest,
+      RequestLocal.noCaching.bufferSupplier
+    )).thenReturn(future)
+
+    kafkaApis = createKafkaApis()
+    kafkaApis.handle(
+      requestChannelRequest,
+      RequestLocal.noCaching
+    )
+
+    future.completeExceptionally(Errors.REBALANCE_IN_PROGRESS.exception)
+    val response = verifyNoThrottling[OffsetCommitResponse](requestChannelRequest)
+    assertEquals(1, response.data.topics.size)
+    assertEquals(1, response.data.topics.get(0).partitions.size)
+    assertEquals(Errors.REBALANCE_IN_PROGRESS.code, response.data.topics.get(0).partitions.get(0).errorCode)
+  }
+
+  @Test
+  def testHandleHeartbeatRequestUnknownMemberId(): Unit = {
+    // A heartbeat from a member whose session already expired on the coordinator (e.g. after
+    // a heartbeat timeout) is rejected with UNKNOWN_MEMBER_ID, which makes the member re-join.
+    val heartbeatRequest = new HeartbeatRequestData()
+      .setGroupId("group")
+      .setMemberId("member")
+      .setGenerationId(0)
+
+    val requestChannelRequest = buildRequest(new HeartbeatRequest.Builder(heartbeatRequest).build())
+
+    val future = new CompletableFuture[HeartbeatResponseData]()
+    when(groupCoordinator.heartbeat(
+      requestChannelRequest.context,
+      heartbeatRequest
+    )).thenReturn(future)
+    kafkaApis = createKafkaApis()
+    kafkaApis.handleHeartbeatRequest(requestChannelRequest)
+
+    future.completeExceptionally(Errors.UNKNOWN_MEMBER_ID.exception)
+    val response = verifyNoThrottling[HeartbeatResponse](requestChannelRequest)
+    assertEquals(Errors.UNKNOWN_MEMBER_ID, response.error)
+  }
+
+  @Test
   def testHandleJoinGroupRequestAuthorizationFailed(): Unit = {
     val joinGroupRequest = new JoinGroupRequestData()
       .setGroupId("group")
